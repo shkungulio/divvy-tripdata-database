@@ -1,0 +1,207 @@
+---
+title: "Divvy Tripdata Database"
+output: 
+  html_document:
+    theme:
+      bg: "#1b1b1b"
+      fg: "#FDF7F7" 
+      primary: "#005E8A"
+      base_font:
+        google: Montserrat
+      code_font:
+        google: JetBrains Mono
+    highlight: espresso
+    css: "resources/styles.css"
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+#Install the following libraries if required
+if(!requireNamespace("RPostgres", quietly = TRUE)){
+  # If not installed, then install it
+  install.packages("RPostgres")
+}
+if(!requireNamespace("DBI", quietly = TRUE)){
+  # If not installed, then install it
+  install.packages("DBI")
+}
+if(!requireNamespace("ini", quietly = TRUE)){
+  # If not installed, then install it
+  install.packages("ini")
+}
+if(!requireNamespace("readr", quietly = TRUE)){
+  # If not installed, then install it
+  install.packages("readr")
+}
+if(!requireNamespace("glue", quietly = TRUE)){
+  # If not installed, then install it
+  install.packages("glue")
+}
+
+# Install necessary libraries
+library(RPostgres)
+library(DBI)
+library(ini)
+library(readr)
+library(glue)
+```
+
+
+## Introduction
+To investigate ride behavior differences between casual and member users and uncover temporal and spatial patterns in ride activity, a comprehensive and well-structured database is essential. The analysis focuses on understanding how ride patterns vary across time—daily, weekly, and seasonally—and space—stations and routes—while identifying trends in ride duration, station popularity, and overall demand. These insights are critical for guiding Divvy’s operational decisions and marketing strategies.
+
+The source data for this project consists of 12 monthly Divvy trip datasets for the year 2024, containing ride-level information such as ride identifiers, timestamps, start and end stations, and user type (casual vs. member). To efficiently support analysis, a relational database will be designed to:
+
+* Consolidate the monthly datasets into a single, queryable structure.
+* Maintain data integrity with primary keys and appropriate data types for timestamps, text fields, and identifiers.
+* Enable temporal analysis by storing ride start and end times in a standardized timestamp format.
+* Support spatial analysis by including station names and IDs, allowing examination of station popularity and route patterns.
+* Facilitate user segmentation by distinguishing between casual and member riders.
+
+By implementing this database, analysts will be able to efficiently query and aggregate data, uncover patterns in ride behavior, and generate actionable insights for Divvy’s operational planning and marketing initiatives.
+
+<br>
+
+## Database Creation
+### Database connection
+```{r db_connection}
+# Read config
+config <- read.ini("resources/db_config.ini")
+db <- config$postgresql
+
+# Safe database connection
+tryCatch({
+  con <- dbConnect(
+    Postgres(),
+    host = db$host,
+    dbname = db$database,
+    user = db$user,
+    password = db$password,
+    port = as.integer(db$port)
+  )
+}, error = function(e) {
+  stop("Database connection failed: ", e$message)
+})
+
+# Register connection for SQL chunks
+knitr::opts_chunk$set(connection = con)
+```
+
+### Create table function
+```{r function}
+# ---- Function to create single unified table ----------------------------
+create_divvy_all_trips_table <- function(con, schema = "divvy", table = "all_trips") {
+  stopifnot(DBI::dbIsValid(con))
+
+  # Ensure schema exists
+  schema_sql <- sprintf("CREATE SCHEMA IF NOT EXISTS %s;",
+                        as.character(DBI::dbQuoteIdentifier(con, schema)))
+  DBI::dbExecute(con, schema_sql)
+
+  # Build CREATE TABLE SQL
+  full_ident <- DBI::dbQuoteIdentifier(con, DBI::Id(schema = schema, table = table))
+  create_sql <- sprintf(
+    "CREATE TABLE IF NOT EXISTS %s (
+      ride_id             text PRIMARY KEY,
+      rideable_type       text,
+      started_at          timestamp without time zone,
+      ended_at            timestamp without time zone,
+      start_station_name  text,
+      start_station_id    text,
+      end_station_name    text,
+      end_station_id      text,
+      start_lat           double precision,
+      start_lng           double precision,
+      end_lat             double precision,
+      end_lng             double precision,
+      member_casual       text
+    );",
+    as.character(full_ident)
+  )
+
+  tryCatch({
+    DBI::dbExecute(con, create_sql)
+    message(sprintf("Ensured table %s.%s exists", schema, table))
+  }, error = function(e) {
+    message(sprintf("Error creating %s.%s: %s", schema, table, e$message))
+  })
+
+  invisible(TRUE)
+}
+```
+
+### Import data function
+```{r}
+# ---- Import all 12 monthly CSVs ------------------------------------------
+import_divvy_csvs <- function(con, data_dir = "resources/data", year = "2024") {
+  months <- sprintf("%02d", 1:12)   # "01" ... "12"
+
+  for (m in months) {
+    file_path <- file.path(data_dir, paste0(year, m, "-divvy-tripdata.csv"))
+
+    if (!file.exists(file_path)) {
+      message(sprintf("File not found: %s (skipping)", file_path))
+      next
+    }
+
+    message(sprintf("Reading %s ...", file_path))
+    rides <- read_csv(file_path,
+                      col_types = cols(
+                        ride_id = col_character(),
+                        rideable_type = col_character(),
+                        started_at = col_datetime(),
+                        ended_at = col_datetime(),
+                        start_station_name = col_character(),
+                        start_station_id = col_character(),
+                        end_station_name = col_character(),
+                        end_station_id = col_character(),
+                        start_lat = col_double(),
+                        start_lng = col_double(),
+                        end_lat = col_double(),
+                        end_lng = col_double(),
+                        member_casual = col_character()
+                      ))
+
+    message(sprintf("Appending %d rows to divvy.all_trips", nrow(rides)))
+    dbWriteTable(
+      con,
+      Id(schema = "divvy", table = "all_trips"),
+      rides,
+      append = TRUE,
+      row.names = FALSE
+    )
+  }
+}
+```
+
+### Create table
+```{r}
+create_divvy_all_trips_table(con, 
+                             schema = "divvy", 
+                             table = "all_trips")
+```
+
+### Import data
+```{r}
+# Run the import
+import_divvy_csvs(con, data_dir = "resources/data", year = "2024")
+```
+
+```{sql}
+SELECT *
+FROM divvy.all_trips
+LIMIT 10;
+```
+
+
+
+
+```{r include=FALSE}
+dbDisconnect(con)
+```
