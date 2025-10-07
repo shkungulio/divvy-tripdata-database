@@ -1,4 +1,4 @@
---- Change the responses accordingly and save the file with .ini extension.
+--- Change the responses accordingly and save the file with .ini extension to connect RStudio with PostgreSQL database.
 
 [postgresql]
 host = your_server_ip
