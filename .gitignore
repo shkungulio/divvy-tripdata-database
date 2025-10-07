@@ -2,5 +2,5 @@
 .Rhistory
 .RData
 .Ruserdata
-.ini
+*.ini
 resources/data

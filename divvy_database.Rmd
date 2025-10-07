@@ -72,10 +72,10 @@ By implementing this database, analysts will be able to efficiently query and ag
 <br>
 
 ## Database Creation
-### Database connection
+### Database Connection
 ```{r db_connection}
 # Read config
-config <- read.ini("resources/db_config.ini")
+config <- read.ini("db_config.ini")
 db <- config$postgresql
 
 # Safe database connection
@@ -131,6 +131,10 @@ for (m in months) {
       member_casual       TEXT
     );
   ")
+  # Drop old table if exists
+  dbExecute(con, glue("DROP TABLE IF EXISTS divvy.{m} CASCADE;"))
+  
+  # Create new table
   dbExecute(con, sql)
 }
 ```
@@ -165,6 +169,225 @@ for (m in 1:12) {
 }
 ```
 
+### Normalize & Combine
+We’ll build a normalized core:
+ - dim_station: unique stations by station_id with most recent name seen (names can drift).
+ - dim_date: calendar table for temporal joins.
+ - dim_member_type, dim_bike_type: small lookup tables.
+ - fact_trips: the single deduplicated table referencing dimensions.
+ 
+#### Dimension tables
+**Station dimension**
+```{sql}
+CREATE TABLE IF NOT EXISTS divvy.dim_station (
+  station_id   TEXT PRIMARY KEY,
+  station_name TEXT,
+  latitude     DOUBLE PRECISION,
+  longitude    DOUBLE PRECISION,
+  updated_at   TIMESTAMP DEFAULT now()
+);
+```
+
+**Member type dimension**
+```{sql}
+CREATE TABLE IF NOT EXISTS divvy.dim_member_type (
+  member_type_id SMALLSERIAL PRIMARY KEY,
+  member_casual  TEXT UNIQUE  -- 'member'/'casual'
+);
+```
+
+Populate member type dimension with known values
+```{sql}
+INSERT INTO divvy.dim_member_type(member_casual)
+VALUES ('member'),('casual')
+ON CONFLICT (member_casual) DO NOTHING;
+```
+
+Bike type dimension
+```{sql}
+CREATE TABLE IF NOT EXISTS divvy.dim_bike_type (
+  bike_type_id SMALLSERIAL PRIMARY KEY,
+  rideable_type TEXT UNIQUE -- 'classic_bike','electric_bike','docked_bike', etc.
+);
+```
+
+Populate dim_bike_type from staging
+```{sql}
+INSERT INTO divvy.dim_bike_type(rideable_type)
+SELECT DISTINCT rideable_type
+FROM (
+  SELECT rideable_type FROM divvy.january
+  UNION ALL SELECT rideable_type FROM divvy.february
+  UNION ALL SELECT rideable_type FROM divvy.march
+  UNION ALL SELECT rideable_type FROM divvy.april
+  UNION ALL SELECT rideable_type FROM divvy.may
+  UNION ALL SELECT rideable_type FROM divvy.june
+  UNION ALL SELECT rideable_type FROM divvy.july
+  UNION ALL SELECT rideable_type FROM divvy.august
+  UNION ALL SELECT rideable_type FROM divvy.september
+  UNION ALL SELECT rideable_type FROM divvy.october
+  UNION ALL SELECT rideable_type FROM divvy.november
+  UNION ALL SELECT rideable_type FROM divvy.december
+) s
+WHERE rideable_type IS NOT NULL
+ON CONFLICT (rideable_type) DO NOTHING;
+```
+
+Build/refresh dim_station from both start and end stations
+```{sql}
+WITH stations AS (
+  SELECT start_station_id AS station_id, max(start_station_name) AS station_name
+  FROM (
+    SELECT * FROM divvy.january
+    UNION ALL SELECT * FROM divvy.february
+    UNION ALL SELECT * FROM divvy.march
+    UNION ALL SELECT * FROM divvy.april
+    UNION ALL SELECT * FROM divvy.may
+    UNION ALL SELECT * FROM divvy.june
+    UNION ALL SELECT * FROM divvy.july
+    UNION ALL SELECT * FROM divvy.august
+    UNION ALL SELECT * FROM divvy.september
+    UNION ALL SELECT * FROM divvy.october
+    UNION ALL SELECT * FROM divvy.november
+    UNION ALL SELECT * FROM divvy.december
+  ) t
+  WHERE start_station_id IS NOT NULL
+  GROUP BY start_station_id
+  UNION
+  SELECT end_station_id AS station_id, max(end_station_name) AS station_name
+  FROM (
+    SELECT * FROM divvy.january
+    UNION ALL SELECT * FROM divvy.february
+    UNION ALL SELECT * FROM divvy.march
+    UNION ALL SELECT * FROM divvy.april
+    UNION ALL SELECT * FROM divvy.may
+    UNION ALL SELECT * FROM divvy.june
+    UNION ALL SELECT * FROM divvy.july
+    UNION ALL SELECT * FROM divvy.august
+    UNION ALL SELECT * FROM divvy.september
+    UNION ALL SELECT * FROM divvy.october
+    UNION ALL SELECT * FROM divvy.november
+    UNION ALL SELECT * FROM divvy.december
+  ) t
+  WHERE end_station_id IS NOT NULL
+  GROUP BY end_station_id
+)
+INSERT INTO divvy.dim_station(station_id, station_name)
+SELECT DISTINCT ON (station_id) station_id, station_name
+FROM stations
+ORDER BY station_id, station_name
+ON CONFLICT (station_id) DO UPDATE
+SET station_name = EXCLUDED.station_name,
+    updated_at   = now();
+```
+
+**Date dimension**
+```{sql}
+CREATE TABLE IF NOT EXISTS divvy.dim_date (
+  date_id        DATE PRIMARY KEY,
+  year           INT,
+  quarter        INT,
+  month          INT,
+  week           INT,
+  day            INT,
+  day_of_week    INT,
+  is_weekend     BOOLEAN
+);
+```
+
+Populate for 2024
+```{sql}
+INSERT INTO divvy.dim_date(date_id, year, quarter, month, week, day, day_of_week, is_weekend)
+SELECT d::date,
+       EXTRACT(YEAR   FROM d)::int,
+       EXTRACT(QUARTER FROM d)::int,
+       EXTRACT(MONTH  FROM d)::int,
+       EXTRACT(WEEK   FROM d)::int,
+       EXTRACT(DAY    FROM d)::int,
+       EXTRACT(DOW    FROM d)::int,
+       (EXTRACT(DOW FROM d) IN (0,6))::boolean
+FROM generate_series('2024-01-01'::date, '2024-12-31'::date, '1 day') AS s(d)
+ON CONFLICT (date_id) DO NOTHING;
+```
+ 
+#### Fact table
+A single deduplicated fact table referencing dimensions.
+```{sql}
+CREATE TABLE IF NOT EXISTS divvy.fact_trips (
+  ride_id            TEXT PRIMARY KEY,
+  bike_type_id       SMALLINT REFERENCES divvy.dim_bike_type(bike_type_id),
+  member_type_id     SMALLINT REFERENCES divvy.dim_member_type(member_type_id),
+  started_at         TIMESTAMP NOT NULL,
+  ended_at           TIMESTAMP NOT NULL,
+  start_station_id   TEXT REFERENCES divvy.dim_station(station_id),
+  end_station_id     TEXT REFERENCES divvy.dim_station(station_id),
+
+  -- Generated duration in minutes (kept in the fact for performance)
+  ride_length_min    DOUBLE PRECISION GENERATED ALWAYS AS
+                      (EXTRACT(EPOCH FROM (ended_at - started_at))/60.0) STORED,
+
+  -- Date keys for fast joins to dim_date
+  started_date       DATE GENERATED ALWAYS AS (started_at::date) STORED,
+  ended_date         DATE GENERATED ALWAYS AS (ended_at::date) STORED,
+
+  -- Basic data quality checks
+  CONSTRAINT chk_positive_duration CHECK (ended_at >= started_at)
+);
+```
+
+#### Helper mappings
+Create helper mapping tables for faster upserts.
+Temporary mapping tables for bike table upserts.
+```{sql}
+-- 
+CREATE TEMP TABLE tmp_bike_map AS
+SELECT rideable_type, bike_type_id FROM divvy.dim_bike_type;
+```
+Temporary mapping tables for member table upserts.
+```{sql}
+CREATE TEMP TABLE tmp_member_map AS
+SELECT member_casual, member_type_id FROM divvy.dim_member_type;
+```
+
+#### Upsert into fact table
+Upsert from all monthly staging tables with dedup (3NF enforced by FKs & PK). Combine and insert with ON CONFLICT DO NOTHING to enforce uniqueness on ride_id.
+```{sql}
+INSERT INTO divvy.fact_trips
+(ride_id, bike_type_id, member_type_id, started_at, ended_at,
+ start_station_id, end_station_id)
+SELECT
+  t.ride_id,
+  b.bike_type_id,
+  mt.member_type_id,
+  t.started_at,
+  t.ended_at,
+  t.start_station_id,
+  t.end_station_id
+FROM (
+  SELECT * FROM divvy.january
+  UNION ALL SELECT * FROM divvy.february
+  UNION ALL SELECT * FROM divvy.march
+  UNION ALL SELECT * FROM divvy.april
+  UNION ALL SELECT * FROM divvy.may
+  UNION ALL SELECT * FROM divvy.june
+  UNION ALL SELECT * FROM divvy.july
+  UNION ALL SELECT * FROM divvy.august
+  UNION ALL SELECT * FROM divvy.september
+  UNION ALL SELECT * FROM divvy.october
+  UNION ALL SELECT * FROM divvy.november
+  UNION ALL SELECT * FROM divvy.december
+) t
+LEFT JOIN tmp_bike_map b ON t.rideable_type = b.rideable_type
+LEFT JOIN tmp_member_map mt ON t.member_casual  = mt.member_casual
+-- Basic sanity: require started_at/ended_at and member/bike maps
+WHERE t.ride_id IS NOT NULL
+  AND t.started_at IS NOT NULL
+  AND t.ended_at   IS NOT NULL
+  AND t.ended_at > t.started_at
+  AND mt.member_type_id IS NOT NULL
+  AND b.bike_type_id   IS NOT NULL
+ON CONFLICT (ride_id) DO NOTHING;
+```
 
 ---------------------------------------------------------------------- The END -----------------------------------------------------------------------
 
