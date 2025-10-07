@@ -1,0 +1,8 @@
+--- Change the responses accordingly and save the file with .ini extension.
+
+[postgresql]
+host = your_server_ip
+database = your_database_name
+user = your_username
+password = yout_password
+port = your_port

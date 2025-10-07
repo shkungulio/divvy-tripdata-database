@@ -49,6 +49,9 @@ library(RPostgres)
 library(DBI)
 library(ini)
 library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
 library(glue)
 ```
 
@@ -93,114 +96,77 @@ tryCatch({
 knitr::opts_chunk$set(connection = con)
 ```
 
-### Create table function
-```{r function}
-# ---- Function to create single unified table ----------------------------
-create_divvy_all_trips_table <- function(con, schema = "divvy", table = "all_trips") {
-  stopifnot(DBI::dbIsValid(con))
-
-  # Ensure schema exists
-  schema_sql <- sprintf("CREATE SCHEMA IF NOT EXISTS %s;",
-                        as.character(DBI::dbQuoteIdentifier(con, schema)))
-  DBI::dbExecute(con, schema_sql)
-
-  # Build CREATE TABLE SQL
-  full_ident <- DBI::dbQuoteIdentifier(con, DBI::Id(schema = schema, table = table))
-  create_sql <- sprintf(
-    "CREATE TABLE IF NOT EXISTS %s (
-      ride_id             text PRIMARY KEY,
-      rideable_type       text,
-      started_at          timestamp without time zone,
-      ended_at            timestamp without time zone,
-      start_station_name  text,
-      start_station_id    text,
-      end_station_name    text,
-      end_station_id      text,
-      start_lat           double precision,
-      start_lng           double precision,
-      end_lat             double precision,
-      end_lng             double precision,
-      member_casual       text
-    );",
-    as.character(full_ident)
-  )
-
-  tryCatch({
-    DBI::dbExecute(con, create_sql)
-    message(sprintf("Ensured table %s.%s exists", schema, table))
-  }, error = function(e) {
-    message(sprintf("Error creating %s.%s: %s", schema, table, e$message))
-  })
-
-  invisible(TRUE)
-}
-```
-
-### Import data function
-```{r}
-# ---- Import all 12 monthly CSVs ------------------------------------------
-import_divvy_csvs <- function(con, data_dir = "resources/data", year = "2024") {
-  months <- sprintf("%02d", 1:12)   # "01" ... "12"
-
-  for (m in months) {
-    file_path <- file.path(data_dir, paste0(year, m, "-divvy-tripdata.csv"))
-
-    if (!file.exists(file_path)) {
-      message(sprintf("File not found: %s (skipping)", file_path))
-      next
-    }
-
-    message(sprintf("Reading %s ...", file_path))
-    rides <- read_csv(file_path,
-                      col_types = cols(
-                        ride_id = col_character(),
-                        rideable_type = col_character(),
-                        started_at = col_datetime(),
-                        ended_at = col_datetime(),
-                        start_station_name = col_character(),
-                        start_station_id = col_character(),
-                        end_station_name = col_character(),
-                        end_station_id = col_character(),
-                        start_lat = col_double(),
-                        start_lng = col_double(),
-                        end_lat = col_double(),
-                        end_lng = col_double(),
-                        member_casual = col_character()
-                      ))
-
-    message(sprintf("Appending %d rows to divvy.all_trips", nrow(rides)))
-    dbWriteTable(
-      con,
-      Id(schema = "divvy", table = "all_trips"),
-      rides,
-      append = TRUE,
-      row.names = FALSE
-    )
-  }
-}
-```
-
-### Create table
-```{r}
-create_divvy_all_trips_table(con, 
-                             schema = "divvy", 
-                             table = "all_trips")
-```
-
-### Import data
-```{r}
-# Run the import
-import_divvy_csvs(con, data_dir = "resources/data", year = "2024")
-```
-
+### Prerequisites
+Enable the `pgcrypto` extension for UUID generation
 ```{sql}
-SELECT *
-FROM divvy.all_trips
-LIMIT 10;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+```
+
+Enable the `btree_gin` extension for better composite indexing
+```{sql}
+CREATE EXTENSION IF NOT EXISTS btree_gin;
+```
+
+### Schema & Base Tables
+Create a schema to hold all Divvy tables
+```{sql}
+CREATE SCHEMA IF NOT EXISTS divvy;
+```
+Create monthly staging tables. Staging tables mirror the CSV columns exactly. They’re fast to load and easy to QA. We’ll later upsert into a normalized fact table.
+```{r}
+months <- c("january","february","march","april","may","june",
+             "july","august","september","october","november","december")
+
+for (m in months) {
+  sql <- glue("
+    CREATE TABLE IF NOT EXISTS divvy.{m} (
+      ride_id             TEXT PRIMARY KEY,
+      rideable_type       TEXT,
+      started_at          TIMESTAMP,
+      ended_at            TIMESTAMP,
+      start_station_name  TEXT,
+      start_station_id    TEXT,
+      end_station_name    TEXT,
+      end_station_id      TEXT,
+      member_casual       TEXT
+    );
+  ")
+  dbExecute(con, sql)
+}
+```
+
+### Load the CSVs
+```{r load_csvs}
+# month name for a given numeric month
+month_name <- function(m) tolower(
+  format(as.Date(paste0("2024-", sprintf("%02d", m), "-01")), "%B"))
+
+# loop and load
+for (m in 1:12) {
+  fname <- sprintf("resources/data/2024%02d-divvy-tripdata.csv", m)
+  tbl   <- month_name(m)
+
+  message("Loading: ", fname, " -> divvy.", tbl)
+  df <- readr::read_csv(fname, show_col_types = FALSE)
+
+  # select/rename only the columns we expect
+  expect <- c("ride_id","rideable_type","started_at","ended_at",
+              "start_station_name","start_station_id",
+              "end_station_name","end_station_id","member_casual")
+  df <- df[, intersect(expect, names(df))]
+
+  DBI::dbWriteTable(
+    con,
+    name = DBI::Id(schema="divvy", table=tbl),
+    value = df,
+    append = TRUE,     # append to existing monthly table
+    row.names = FALSE
+  )
+}
 ```
 
 
-
+---------------------------------------------------------------------- The END -----------------------------------------------------------------------
 
 ```{r include=FALSE}
 dbDisconnect(con)
