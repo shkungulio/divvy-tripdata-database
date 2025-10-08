@@ -19,42 +19,9 @@ output:
       smooth_scroll: false
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 
-#Install the following libraries if required
-if(!requireNamespace("RPostgres", quietly = TRUE)){
-  # If not installed, then install it
-  install.packages("RPostgres")
-}
-if(!requireNamespace("DBI", quietly = TRUE)){
-  # If not installed, then install it
-  install.packages("DBI")
-}
-if(!requireNamespace("ini", quietly = TRUE)){
-  # If not installed, then install it
-  install.packages("ini")
-}
-if(!requireNamespace("readr", quietly = TRUE)){
-  # If not installed, then install it
-  install.packages("readr")
-}
-if(!requireNamespace("glue", quietly = TRUE)){
-  # If not installed, then install it
-  install.packages("glue")
-}
 
-# Install necessary libraries
-library(RPostgres)
-library(DBI)
-library(ini)
-library(readr)
-library(dplyr)
-library(lubridate)
-library(ggplot2)
-library(glue)
-```
-
+<br>
 
 ## Introduction
 To investigate ride behavior differences between casual and member users and uncover temporal and spatial patterns in ride activity, a comprehensive and well-structured database is essential. The analysis focuses on understanding how ride patterns vary across time—daily, weekly, and seasonally—and space—stations and routes—while identifying trends in ride duration, station popularity, and overall demand. These insights are critical for guiding Divvy’s operational decisions and marketing strategies.
@@ -72,8 +39,30 @@ By implementing this database, analysts will be able to efficiently query and ag
 <br>
 
 ## Database Creation
+### Enviroment Setup
+In this setup chunk, I prepare the R environment for the project. I suppress warnings and messages, set the CRAN mirror to avoid installation errors, and ensure that all the necessary packages (RPostgres, DBI, ini, tidyverse, readr, glue, ISOweek) are installed and loaded. This guarantees that all dependencies are available before running any database or data processing operations.
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Set default CRAN mirror (fixes the error)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+#Install the following libraries if required
+# List of required packages
+required_pkgs <- c("RPostgres", "DBI", "ini", "tidyverse", "readr", "glue", "ISOweek")
+
+# Install and load each package
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+  library(pkg, character.only = TRUE)
+}
+```
+
 ### Database Connection
-```{r db_connection}
+Here, I read my PostgreSQL database credentials from a secure .ini configuration file and establish a connection using the RPostgres driver. I wrap the connection inside a tryCatch() block to handle connection errors gracefully. Once the connection is established, I register it for use by all subsequent SQL chunks.
+```{r db_connection, warning=FALSE, message=FALSE}
 # Read config
 config <- read.ini("db_config.ini")
 db <- config$postgresql
@@ -97,23 +86,24 @@ knitr::opts_chunk$set(connection = con)
 ```
 
 ### Prerequisites
-Enable the `pgcrypto` extension for UUID generation
-```{sql}
+I enable the PostgreSQL pgcrypto extension, which allows me to use functions for encryption, hashing, and UUID generation. This is especially helpful for generating unique identifiers or securing sensitive fields.
+```{sql pgcrypto_extension}
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 ```
 
-Enable the `btree_gin` extension for better composite indexing
-```{sql}
+In this chunk, I enable the `btree_gin` extension to improve query performance on composite or full-text indexes. This will enhance the speed of analytical queries and materialized view refreshes later in the project.
+```{sql btree_gin_extension}
 CREATE EXTENSION IF NOT EXISTS btree_gin;
 ```
 
 ### Schema & Base Tables
-Create a schema to hold all Divvy tables
-```{sql}
+I create a dedicated schema named divvy. This schema acts as a container for all Divvy-related tables, views, and functions, keeping the project organized and logically separated from other database objects.
+```{sql create_schema}
 CREATE SCHEMA IF NOT EXISTS divvy;
 ```
-Create monthly staging tables. Staging tables mirror the CSV columns exactly. They’re fast to load and easy to QA. We’ll later upsert into a normalized fact table.
-```{r}
+
+This R chunk automatically creates 12 monthly staging tables, one for each month of 2024. Each table structure matches the columns of the Divvy CSV data files. Before creating a new table, I drop any existing table of the same name to avoid conflicts or outdated structures.
+```{r create_staging_tables}
 months <- c("january","february","march","april","may","june",
              "july","august","september","october","november","december")
 
@@ -140,7 +130,8 @@ for (m in months) {
 ```
 
 ### Load the CSVs
-```{r load_csvs}
+I loop through all twelve monthly CSV files, load each into R, clean and align the column names with the expected schema, and then write each dataset into its corresponding monthly table inside the PostgreSQL database. This ensures each month’s data is properly imported and stored for further processing.
+```{r load_csv_files}
 # month name for a given numeric month
 month_name <- function(m) tolower(
   format(as.Date(paste0("2024-", sprintf("%02d", m), "-01")), "%B"))
@@ -178,7 +169,8 @@ We’ll build a normalized core:
  
 #### Dimension tables
 **Station dimension**
-```{sql}
+I create a dimension table called `dim_station` to store information about each bike station. This includes station ID, name, and coordinates (latitude and longitude). It provides a reference point for mapping and spatial analysis.
+```{sql dim_station}
 CREATE TABLE IF NOT EXISTS divvy.dim_station (
   station_id   TEXT PRIMARY KEY,
   station_name TEXT,
@@ -189,30 +181,31 @@ CREATE TABLE IF NOT EXISTS divvy.dim_station (
 ```
 
 **Member type dimension**
-```{sql}
+This chunk defines the `dim_member_type` table, which holds information about user types—whether the rider is a “member” or “casual.” It’s a small but essential lookup table that helps enforce referential integrity and simplifies queries that aggregate data by rider type.
+```{sql dim_member_type}
 CREATE TABLE IF NOT EXISTS divvy.dim_member_type (
   member_type_id SMALLSERIAL PRIMARY KEY,
   member_casual  TEXT UNIQUE  -- 'member'/'casual'
 );
 ```
 
-Populate member type dimension with known values
-```{sql}
+I populate the dim_member_type table with the two standard values: “member” and “casual.” I include an ON CONFLICT DO NOTHING clause so that the insert operation won’t fail if these records already exist.
+```{sql populate_member_type}
 INSERT INTO divvy.dim_member_type(member_casual)
 VALUES ('member'),('casual')
 ON CONFLICT (member_casual) DO NOTHING;
 ```
 
-Bike type dimension
-```{sql}
+Here, I create another dimension table called `dim_bike_type`. This table stores unique bike types, such as “electric,” “classic,” or “docked.” By separating these into a dimension, I make the schema more normalized and efficient to query.
+```{sql dim_bike_type}
 CREATE TABLE IF NOT EXISTS divvy.dim_bike_type (
   bike_type_id SMALLSERIAL PRIMARY KEY,
   rideable_type TEXT UNIQUE -- 'classic_bike','electric_bike','docked_bike', etc.
 );
 ```
 
-Populate dim_bike_type from staging
-```{sql}
+I insert the known bike types into `dim_bike_type`, ensuring that any duplicates are ignored using ON CONFLICT DO NOTHING. This provides a clean and consistent reference for all rides in the fact table.
+```{sql populate_bike_type}
 INSERT INTO divvy.dim_bike_type(rideable_type)
 SELECT DISTINCT rideable_type
 FROM (
@@ -234,7 +227,7 @@ ON CONFLICT (rideable_type) DO NOTHING;
 ```
 
 Build/refresh dim_station from both start and end stations
-```{sql}
+```{sql populate_dim_station}
 WITH stations AS (
   SELECT start_station_id AS station_id, max(start_station_name) AS station_name
   FROM (
@@ -282,7 +275,7 @@ SET station_name = EXCLUDED.station_name,
 ```
 
 **Date dimension**
-```{sql}
+```{sql dim_date}
 CREATE TABLE IF NOT EXISTS divvy.dim_date (
   date_id        DATE PRIMARY KEY,
   year           INT,
@@ -296,7 +289,7 @@ CREATE TABLE IF NOT EXISTS divvy.dim_date (
 ```
 
 Populate for 2024
-```{sql}
+```{sql populate_dim_date}
 INSERT INTO divvy.dim_date(date_id, year, quarter, month, week, day, day_of_week, is_weekend)
 SELECT d::date,
        EXTRACT(YEAR   FROM d)::int,
@@ -311,8 +304,8 @@ ON CONFLICT (date_id) DO NOTHING;
 ```
  
 #### Fact table
-A single deduplicated fact table referencing dimensions.
-```{sql}
+In this SQL chunk, I define the central fact table — `fact_trips`. It contains every individual trip record with foreign keys linking to the relevant dimensions (`bike_type_id`, `member_type_id`, and `station_id`). This is the heart of the star schema that enables efficient analytics and aggregations.
+```{sql fact_trips}
 CREATE TABLE IF NOT EXISTS divvy.fact_trips (
   ride_id            TEXT PRIMARY KEY,
   bike_type_id       SMALLINT REFERENCES divvy.dim_bike_type(bike_type_id),
@@ -336,22 +329,20 @@ CREATE TABLE IF NOT EXISTS divvy.fact_trips (
 ```
 
 #### Helper mappings
-Create helper mapping tables for faster upserts.
 Temporary mapping tables for bike table upserts.
-```{sql}
--- 
+```{sql tmp_bike_map}
 CREATE TEMP TABLE tmp_bike_map AS
 SELECT rideable_type, bike_type_id FROM divvy.dim_bike_type;
 ```
 Temporary mapping tables for member table upserts.
-```{sql}
+```{sql tmp_member_map}
 CREATE TEMP TABLE tmp_member_map AS
 SELECT member_casual, member_type_id FROM divvy.dim_member_type;
 ```
 
 #### Upsert into fact table
-Upsert from all monthly staging tables with dedup (3NF enforced by FKs & PK). Combine and insert with ON CONFLICT DO NOTHING to enforce uniqueness on ride_id.
-```{sql}
+This is where I load all twelve months of trip data from the staging tables into the main fact_trips table. During insertion, I join with the dimension tables to replace text values (like rideable_type and member_casual) with their corresponding foreign key IDs. This ensures data consistency and enforces referential integrity.
+```{sql upsert_fact_trips}
 INSERT INTO divvy.fact_trips
 (ride_id, bike_type_id, member_type_id, started_at, ended_at,
  start_station_id, end_station_id)
@@ -389,7 +380,341 @@ WHERE t.ride_id IS NOT NULL
 ON CONFLICT (ride_id) DO NOTHING;
 ```
 
----------------------------------------------------------------------- The END -----------------------------------------------------------------------
+### Indexes
+```{sql idx_fact_trips_started_at}
+-- Time
+CREATE INDEX IF NOT EXISTS idx_fact_trips_started_at    
+ON divvy.fact_trips(started_at);
+```
+
+```{sql idx_fact_trips_ended_start_date}
+-- Time
+CREATE INDEX IF NOT EXISTS idx_fact_trips_started_date  
+ON divvy.fact_trips(started_date);
+```
+
+```{sql idx_fact_member_type}
+-- User & bike segments
+CREATE INDEX IF NOT EXISTS idx_fact_member_type  
+ON divvy.fact_trips(member_type_id);
+```
+
+```{sql idx_fact_bike_type}
+-- User & bike segments
+CREATE INDEX IF NOT EXISTS idx_fact_bike_type    
+ON divvy.fact_trips(bike_type_id);
+```
+
+```{sql idx_fact_start_station}
+-- Stations & routes
+CREATE INDEX IF NOT EXISTS idx_fact_start_station 
+ON divvy.fact_trips(start_station_id);
+```
+
+```{sql idx_fact_end_station}
+-- Stations & routes
+CREATE INDEX IF NOT EXISTS idx_fact_end_station   
+ON divvy.fact_trips(end_station_id);
+```
+
+```{sql idx_fact_route}
+-- Stations & routes
+CREATE INDEX IF NOT EXISTS idx_fact_route 
+ON divvy.fact_trips(start_station_id, end_station_id);
+```
+
+```{sql idx_fact_duration}
+-- Duration (functional)
+CREATE INDEX IF NOT EXISTS idx_fact_duration 
+ON divvy.fact_trips(ride_length_min);
+```
+
+```{sql idx_fact_member_date}
+-- Composite for frequent filters
+CREATE INDEX IF NOT EXISTS idx_fact_member_date 
+ON divvy.fact_trips(member_type_id, started_date);
+```
+
+### Views
+I create a view called `vw_trips_enriched` that joins the fact_trips table with all related dimension tables. This view allows me to query descriptive fields (like station names and member types) without manually joining the tables every time, making analysis simpler and faster.
+```{sql vw_trips_enriched}
+-- Map ids back to friendly labels in one place
+CREATE OR REPLACE VIEW divvy.vw_trips_enriched AS
+SELECT
+  f.ride_id,
+  bt.rideable_type,
+  mt.member_casual,
+  f.started_at, f.ended_at, f.ride_length_min,
+  f.start_station_id, s1.station_name AS start_station_name,
+  f.end_station_id,   s2.station_name AS end_station_name,
+  f.started_date, d.year, d.month, d.week, d.day_of_week, d.is_weekend
+FROM divvy.fact_trips f
+JOIN divvy.dim_bike_type   bt ON f.bike_type_id   = bt.bike_type_id
+JOIN divvy.dim_member_type mt ON f.member_type_id = mt.member_type_id
+LEFT JOIN divvy.dim_station s1 ON f.start_station_id = s1.station_id
+LEFT JOIN divvy.dim_station s2 ON f.end_station_id   = s2.station_id
+LEFT JOIN divvy.dim_date    d  ON f.started_date     = d.date_id;
+```
+
+```{sql vw_daily_counts}
+-- Daily counts by segment
+CREATE OR REPLACE VIEW divvy.vw_daily_counts AS
+SELECT
+  started_date,
+  member_casual,
+  COUNT(*) AS rides,
+  AVG(ride_length_min) AS avg_min
+FROM divvy.vw_trips_enriched
+GROUP BY started_date, member_casual;
+```
+
+```{sql vw_weekly_counts}
+-- Weekly segment trends
+CREATE OR REPLACE VIEW divvy.vw_weekly_counts AS
+SELECT
+  d.year,
+  d.week,
+  t.member_casual,
+  COUNT(*) AS rides
+FROM divvy.vw_trips_enriched t
+JOIN divvy.dim_date d ON t.started_date = d.date_id
+GROUP BY d.year, d.week, t.member_casual;
+```
+
+```{sql vw_top_start_stations}
+-- Top stations (starts)
+CREATE OR REPLACE VIEW divvy.vw_top_start_stations AS
+SELECT
+  start_station_id,
+  start_station_name,
+  COUNT(*) AS rides
+FROM divvy.vw_trips_enriched
+GROUP BY start_station_id, start_station_name
+ORDER BY rides DESC;
+```
+
+This chunk creates a summarized view called `vw_route_counts` that aggregates the number of rides between each start and end station, grouped by user type. It provides an easy way to analyze popular routes and compare travel patterns between members and casual users.
+```{sql vw_route_counts}
+CREATE OR REPLACE VIEW divvy.vw_route_counts AS
+SELECT
+  start_station_id, start_station_name,
+  end_station_id,   end_station_name,
+  COUNT(*) AS rides
+FROM divvy.vw_trips_enriched
+GROUP BY start_station_id, start_station_name, end_station_id, end_station_name;
+```
+
+I define a materialized view called `mv_monthly_summary` that pre-aggregates key metrics like total rides and average durations by month and user type. This helps me quickly run time-based analyses without recalculating from raw trip data every time.
+```{sql mv_monthly_summary}
+CREATE MATERIALIZED VIEW IF NOT EXISTS divvy.mv_monthly_summary AS
+SELECT
+  d.year, d.month,
+  t.member_casual,
+  COUNT(*) AS rides,
+  AVG(t.ride_length_min) AS avg_min
+FROM divvy.vw_trips_enriched t
+JOIN divvy.dim_date d ON t.started_date = d.date_id
+GROUP BY d.year, d.month, t.member_casual;
+```
+
+In this chunk, I include a command to refresh the materialized view when new trip data is added. This ensures that the summary statistics remain up to date with the latest data in the database.
+```{sql refresh_mv_monthly_summary}
+-- Refresh when new data lands
+REFRESH MATERIALIZED VIEW divvy.mv_monthly_summary;
+```
+
+### Helper Functions
+Normalize station name (trim/lower) for QA joins
+```{sql norm_station_name}
+CREATE OR REPLACE FUNCTION divvy.norm_station_name(txt TEXT)
+RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
+  SELECT NULLIF(regexp_replace(lower(trim(txt)), '\s+', ' ', 'g'),'');
+$$;
+```
+Quick route key (for joining/BI)
+```{sql route_key}
+CREATE OR REPLACE FUNCTION divvy.route_key(start_id TEXT, end_id TEXT)
+RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
+  SELECT start_id || '→' || end_id;
+$$;
+```
+
+<br>
+
+## Exploratory Data Analysis (SQL)
+### Segment share
+Segment share over time (daily)
+```{sql daily_counts}
+SELECT * 
+FROM divvy.vw_daily_counts 
+ORDER BY started_date, member_casual;
+```
+
+### Weekly trend
+Weekly trend by segment
+```{sql weekly_counts}
+SELECT * 
+FROM divvy.vw_weekly_counts 
+ORDER BY year, week, member_casual;
+```
+
+### Duration distribution
+```{sql duration_distribution}
+SELECT
+  width_bucket(ride_length_min, 0, 120, 12) AS bin, -- 10 min bins up to 120
+  COUNT(*) AS rides
+FROM divvy.vw_trips_enriched
+WHERE ride_length_min BETWEEN 0 AND 180
+GROUP BY bin
+ORDER BY bin;
+```
+
+### Top 10 start/end stations
+This query identifies the top start stations by total rides, ranking them in descending order. I join fact_trips with dim_station to retrieve human-readable names and then group by start_station_name. By analyzing the top stations for casual and member users separately, I can identify geographic hotspots — members may cluster around transit hubs or offices, while casuals may favor tourist or recreational areas. This insight supports both operational logistics (bike placement) and marketing segmentation.
+```{sql top_start_stations}
+SELECT * FROM divvy.vw_top_start_stations LIMIT 10;
+```
+
+Similar to the previous chunk, this query ranks the top end stations by trip count. Analyzing both start and end station patterns helps reveal common travel flows — whether users tend to return bikes at the same stations or follow distinct routes. Comparing casual and member drop-off behavior highlights differences in trip intent: members may end rides near workplaces or transit, while casuals might finish near parks or attractions. This spatial perspective is crucial for demand forecasting and route planning.
+```{sql top_end_stations}
+SELECT
+  end_station_id, end_station_name, COUNT(*) AS rides
+FROM divvy.vw_trips_enriched
+GROUP BY end_station_id, end_station_name
+ORDER BY rides DESC
+LIMIT 10;
+```
+
+### Top routes
+In this SQL chunk, I identify the most common start–end station combinations, or “routes,” based on the number of rides taken along each. I join the tables vw_route_counts and vw_trips_enriched using station IDs and group by start station, end station, and user type (member_casual). Then I order the results by descending ride counts and limit to the top 10.
+```{sql top_routes}
+SELECT
+  start_station_name, end_station_name, member_casual,
+  COUNT(*) AS rides
+FROM divvy.vw_trips_enriched
+GROUP BY start_station_name, end_station_name, member_casual
+ORDER BY rides DESC
+LIMIT 10;
+```
+
+### Peak by hour and weekday
+```{sql peak_by_hour_dow}
+SELECT
+  EXTRACT(DOW FROM started_at) AS dow,
+  EXTRACT(HOUR FROM started_at) AS hr,
+  COUNT(*) AS rides
+FROM divvy.fact_trips f
+GROUP BY 1,2
+ORDER BY 1,2;
+```
+
+<br>
+
+## Exploratory Data Analysis (R)
+### Daily rides by segment
+```{r eda_daily_rides}
+# 8.1 Daily rides by segment
+daily <- dbGetQuery(con, "SELECT started_date, member_casual, rides
+                          FROM divvy.vw_daily_counts")
+ggplot(daily, aes(as.Date(started_date), rides, color = member_casual)) +
+  geom_line() +
+  labs(title = "Daily rides by segment (2024)",
+       x = "Date", y = "Rides", color = "User Type")
+```
+
+### Weekly trend
+```{r eda_weekly_trend}
+# 8.2 Weekly trend
+weekly <- dbGetQuery(con, "SELECT year, week, member_casual, rides
+                           FROM divvy.vw_weekly_counts")
+weekly$date <- ISOweek2date(paste0(weekly$year, "-W", sprintf("%02d", weekly$week), "-1"))
+ggplot(weekly, aes(date, rides, color = member_casual)) +
+  geom_line() +
+  labs(title = "Weekly rides by segment (2024)",
+       x = "Week", y = "Rides", color = "User Type")
+```
+
+### Duration distribution
+```{r eda_duration_distribution}
+# 8.3 Duration distribution
+dur <- dbGetQuery(con, "
+  SELECT ride_length_min
+  FROM divvy.vw_trips_enriched
+  WHERE ride_length_min BETWEEN 0 AND 180
+")
+ggplot(dur, aes(ride_length_min)) +
+  geom_histogram(binwidth = 5) +
+  labs(title = "Ride duration distribution (<= 180 mins)",
+       x = "Minutes", y = "Count")
+```
+
+### Top stations
+```{r eda_top_stations}
+# 8.4 Top stations
+topstarts <- dbGetQuery(con, "
+                        SELECT * 
+                        FROM divvy.vw_top_start_stations 
+                        LIMIT 10")
+topstarts <- topstarts %>% mutate(rank = row_number())
+ggplot(topstarts, aes(reorder(start_station_name, rides), rides)) +
+  geom_col() +
+  coord_flip() +
+  labs(title="Top 10 start stations", x="", y="Rides")
+```
+
+### Top routes by segment
+```{r eda5_top_routes}
+routes <- dbGetQuery(con, "
+  SELECT 
+    rc.start_station_name,
+    rc.end_station_name,
+    te.member_casual,
+    rc.rides
+  FROM divvy.vw_route_counts AS rc
+  JOIN divvy.vw_trips_enriched AS te
+    ON rc.start_station_id = te.start_station_id
+   AND rc.end_station_id = te.end_station_id
+  GROUP BY rc.start_station_name, rc.end_station_name, te.member_casual, rc.rides
+  ORDER BY rc.rides DESC
+  LIMIT 30;
+")
+```
+
+<br>
+
+## Data Quality & Maintenance
+### Quick checks
+I check for missing data in key columns such as start and end stations or bike type. This helps me identify potential data quality issues or incomplete records that may need cleaning before analysis.
+```{sql check_missing_criticals}
+SELECT
+  SUM((started_at IS NULL)::int) AS missing_started,
+  SUM((ended_at   IS NULL)::int) AS missing_ended,
+  SUM((ride_id    IS NULL)::int) AS missing_ids
+FROM divvy.fact_trips;
+```
+
+I look for duplicate ride_id entries in the fact table. Since ride_id should be unique for each trip, this step ensures the integrity of the dataset and prevents double-counting in later analysis.
+```{sql check_duplicates}
+SELECT ride_id, COUNT(*) FROM divvy.fact_trips
+GROUP BY ride_id HAVING COUNT(*) > 1;
+```
+
+Check for negative or zero durations (should be 0 due to CHECK constraint)
+```{sql check_negative_durations}
+SELECT COUNT(*) FROM divvy.fact_trips
+WHERE ended_at < started_at OR ride_length_min < 0;
+```
+
+### Refresh cadence
+```{sql refresh2_mv_monthly_summary}
+-- When new months arrive, re-run:
+-- 1) load into staging,
+-- 2) INSERT .. ON CONFLICT into dimensions & fact,
+-- 3) REFRESH materialized views
+REFRESH MATERIALIZED VIEW divvy.mv_monthly_summary;
+```
+
+----------------------------------------------------------------------- The END -----------------------------------------------------------------------
 
 ```{r include=FALSE}
 dbDisconnect(con)
