@@ -436,7 +436,7 @@ ON divvy.fact_trips(member_type_id, started_date);
 ```
 
 ### Views
-I create a view called `vw_trips_enriched` that joins the fact_trips table with all related dimension tables. This view allows me to query descriptive fields (like station names and member types) without manually joining the tables every time, making analysis simpler and faster.
+In this view, I combined all the essential trip details with computed fields like ride duration and date attributes. My goal was to enrich the base trip data for easier querying later on. By including calculated columns such as ride_length_min and day_of_week, I can perform time-based and duration-based analyses without recalculating these metrics repeatedly.
 ```{sql vw_trips_enriched}
 -- Map ids back to friendly labels in one place
 CREATE OR REPLACE VIEW divvy.vw_trips_enriched AS
@@ -456,6 +456,7 @@ LEFT JOIN divvy.dim_station s2 ON f.end_station_id   = s2.station_id
 LEFT JOIN divvy.dim_date    d  ON f.started_date     = d.date_id;
 ```
 
+I created this view to analyze ride activity on a daily basis. It summarizes the number of trips taken by members and casual users for each calendar date. This structure allows me to quickly visualize and compare daily ride patterns, identify high-demand days, and observe behavioral differences between user groups over time.
 ```{sql vw_daily_counts}
 -- Daily counts by segment
 CREATE OR REPLACE VIEW divvy.vw_daily_counts AS
@@ -468,6 +469,7 @@ FROM divvy.vw_trips_enriched
 GROUP BY started_date, member_casual;
 ```
 
+This view aggregates rides into weekly periods using ISO week notation. I use it to examine broader temporal trends and seasonal patterns. By grouping trips by week and user type, I can evaluate week-over-week changes, measure sustained demand, and identify potential seasonal effects in ride behavior.
 ```{sql vw_weekly_counts}
 -- Weekly segment trends
 CREATE OR REPLACE VIEW divvy.vw_weekly_counts AS
@@ -481,6 +483,7 @@ JOIN divvy.dim_date d ON t.started_date = d.date_id
 GROUP BY d.year, d.week, t.member_casual;
 ```
 
+I built this view to pinpoint the most popular starting stations across the Divvy system. It ranks stations based on the number of trips initiated from each location. This helps me identify high-traffic areas, assess spatial demand distribution, and inform potential rebalancing or marketing strategies for specific neighborhoods.
 ```{sql vw_top_start_stations}
 -- Top stations (starts)
 CREATE OR REPLACE VIEW divvy.vw_top_start_stations AS
@@ -493,7 +496,7 @@ GROUP BY start_station_id, start_station_name
 ORDER BY rides DESC;
 ```
 
-This chunk creates a summarized view called `vw_route_counts` that aggregates the number of rides between each start and end station, grouped by user type. It provides an easy way to analyze popular routes and compare travel patterns between members and casual users.
+This view focuses on trip flows between start and end stations — essentially capturing the most common routes taken by users. By counting and grouping rides by both origin and destination, I can visualize movement patterns within the network, identify frequent commuter paths, and support infrastructure or operational planning.
 ```{sql vw_route_counts}
 CREATE OR REPLACE VIEW divvy.vw_route_counts AS
 SELECT
