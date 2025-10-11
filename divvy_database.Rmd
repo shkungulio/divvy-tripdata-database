@@ -44,6 +44,10 @@ In this setup chunk, I prepare the R environment for the project. I suppress war
 ```{r setup, warning=FALSE, message=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 
+# Show all rows in tibbles/data frames
+options(dplyr.print_min = Inf, dplyr.print_max = Inf)
+
+
 # Set default CRAN mirror (fixes the error)
 options(repos = c(CRAN = "https://cloud.r-project.org"))
 
@@ -154,7 +158,7 @@ for (m in 1:12) {
     con,
     name = DBI::Id(schema="divvy", table=tbl),
     value = df,
-    append = TRUE,     # append to existing monthly table
+    append = TRUE,
     row.names = FALSE
   )
 }
@@ -185,7 +189,7 @@ This chunk defines the `dim_member_type` table, which holds information about us
 ```{sql dim_member_type}
 CREATE TABLE IF NOT EXISTS divvy.dim_member_type (
   member_type_id SMALLSERIAL PRIMARY KEY,
-  member_casual  TEXT UNIQUE  -- 'member'/'casual'
+  member_casual  TEXT UNIQUE
 );
 ```
 
@@ -200,7 +204,7 @@ Here, I create another dimension table called `dim_bike_type`. This table stores
 ```{sql dim_bike_type}
 CREATE TABLE IF NOT EXISTS divvy.dim_bike_type (
   bike_type_id SMALLSERIAL PRIMARY KEY,
-  rideable_type TEXT UNIQUE -- 'classic_bike','electric_bike','docked_bike', etc.
+  rideable_type TEXT UNIQUE
 );
 ```
 
@@ -381,56 +385,56 @@ ON CONFLICT (ride_id) DO NOTHING;
 ```
 
 ### Indexes
+I added this index to make time-bounded scans fast (hours, days, months) without sweeping the entire table. It powers range filters like WHERE started_at BETWEEN … and prepares data quickly for trend views. I accept a bit of write overhead in exchange for much faster reads, and I run ANALYZE after monthly loads.
 ```{sql idx_fact_trips_started_at}
--- Time
 CREATE INDEX IF NOT EXISTS idx_fact_trips_started_at    
 ON divvy.fact_trips(started_at);
 ```
 
+Daily reporting is a core workflow for me, so I index a stored DATE rather than recalculating from the timestamp each time. This speeds WHERE started_date BETWEEN … and GROUP BY started_date in my daily trends, with minimal storage cost. After bulk loads, I refresh stats and confirm plans with EXPLAIN.
 ```{sql idx_fact_trips_ended_start_date}
--- Time
 CREATE INDEX IF NOT EXISTS idx_fact_trips_started_date  
 ON divvy.fact_trips(started_date);
 ```
 
+Member vs casual is my primary segmentation, so I keep a lightweight index here to accelerate filters, splits, and joins to dim_member_type. On its own the selectivity is modest, but it shines when paired with date or station predicates in real queries.
 ```{sql idx_fact_member_type}
--- User & bike segments
 CREATE INDEX IF NOT EXISTS idx_fact_member_type  
 ON divvy.fact_trips(member_type_id);
 ```
 
+I frequently compare KPIs by bike class (classic/electric/docked). This compact index supports those slices and composes nicely with time and location filters. It’s small, low-maintenance, and consistently helpful during EDA.
 ```{sql idx_fact_bike_type}
--- User & bike segments
 CREATE INDEX IF NOT EXISTS idx_fact_bike_type    
 ON divvy.fact_trips(bike_type_id);
 ```
 
+Origin-focused analyses (busiest starts, station drill-downs) rely on quick point lookups. This index speeds WHERE start_station_id = … and plays well with date filters for station heatmaps and dashboards. I keep an eye on skew in case a few stations dominate.
 ```{sql idx_fact_start_station}
--- Stations & routes
 CREATE INDEX IF NOT EXISTS idx_fact_start_station 
 ON divvy.fact_trips(start_station_id);
 ```
 
+Destination-centric questions (popular drop-offs, rebalancing signals) need the same fast path. This mirrors the start-station index to support flexible route exploration and joins to dim_station, with minimal overhead.
 ```{sql idx_fact_end_station}
--- Stations & routes
 CREATE INDEX IF NOT EXISTS idx_fact_end_station   
 ON divvy.fact_trips(end_station_id);
 ```
 
+Route (OD pair) analytics are central to flow insights. Ordering the columns as (start, end) matches my most common filter (origin first) and enables prefix scans for “all destinations from A.” If most route queries add tight date windows, I may introduce a targeted three-column variant for hot paths.
 ```{sql idx_fact_route}
--- Stations & routes
 CREATE INDEX IF NOT EXISTS idx_fact_route 
 ON divvy.fact_trips(start_station_id, end_station_id);
 ```
 
+I routinely trim outliers and analyze duration-bounded subsets, so this index speeds WHERE ride_length_min BETWEEN …. Its value is highest when combined with time or station filters; if “valid ranges only” become standard, I’ll consider a partial index to cut scan costs.
 ```{sql idx_fact_duration}
--- Duration (functional)
 CREATE INDEX IF NOT EXISTS idx_fact_duration 
 ON divvy.fact_trips(ride_length_min);
 ```
 
+This is my workhorse for “member vs casual by day.” Equality on member type followed by a date range aligns perfectly with common filters and delivers efficient scans for daily summaries and dashboards. I keep the standalone started_date index for date-only workloads.
 ```{sql idx_fact_member_date}
--- Composite for frequent filters
 CREATE INDEX IF NOT EXISTS idx_fact_member_date 
 ON divvy.fact_trips(member_type_id, started_date);
 ```
@@ -438,7 +442,6 @@ ON divvy.fact_trips(member_type_id, started_date);
 ### Views
 In this view, I combined all the essential trip details with computed fields like ride duration and date attributes. My goal was to enrich the base trip data for easier querying later on. By including calculated columns such as ride_length_min and day_of_week, I can perform time-based and duration-based analyses without recalculating these metrics repeatedly.
 ```{sql vw_trips_enriched}
--- Map ids back to friendly labels in one place
 CREATE OR REPLACE VIEW divvy.vw_trips_enriched AS
 SELECT
   f.ride_id,
@@ -458,7 +461,6 @@ LEFT JOIN divvy.dim_date    d  ON f.started_date     = d.date_id;
 
 I created this view to analyze ride activity on a daily basis. It summarizes the number of trips taken by members and casual users for each calendar date. This structure allows me to quickly visualize and compare daily ride patterns, identify high-demand days, and observe behavioral differences between user groups over time.
 ```{sql vw_daily_counts}
--- Daily counts by segment
 CREATE OR REPLACE VIEW divvy.vw_daily_counts AS
 SELECT
   started_date,
@@ -471,7 +473,6 @@ GROUP BY started_date, member_casual;
 
 This view aggregates rides into weekly periods using ISO week notation. I use it to examine broader temporal trends and seasonal patterns. By grouping trips by week and user type, I can evaluate week-over-week changes, measure sustained demand, and identify potential seasonal effects in ride behavior.
 ```{sql vw_weekly_counts}
--- Weekly segment trends
 CREATE OR REPLACE VIEW divvy.vw_weekly_counts AS
 SELECT
   d.year,
@@ -485,7 +486,6 @@ GROUP BY d.year, d.week, t.member_casual;
 
 I built this view to pinpoint the most popular starting stations across the Divvy system. It ranks stations based on the number of trips initiated from each location. This helps me identify high-traffic areas, assess spatial demand distribution, and inform potential rebalancing or marketing strategies for specific neighborhoods.
 ```{sql vw_top_start_stations}
--- Top stations (starts)
 CREATE OR REPLACE VIEW divvy.vw_top_start_stations AS
 SELECT
   start_station_id,
@@ -522,7 +522,6 @@ GROUP BY d.year, d.month, t.member_casual;
 
 In this chunk, I include a command to refresh the materialized view when new trip data is added. This ensures that the summary statistics remain up to date with the latest data in the database.
 ```{sql refresh_mv_monthly_summary}
--- Refresh when new data lands
 REFRESH MATERIALIZED VIEW divvy.mv_monthly_summary;
 ```
 
