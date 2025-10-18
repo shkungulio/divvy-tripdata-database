@@ -1,6 +1,12 @@
 ---
 title: "Divvy Tripdata Database"
+author: "Seif Kungulio"
+date: "`r Sys.Date()`"
+description: "Building a relational database for Divvy tripdata analysis"
+categories: [R, SQL, Database, Data Analysis]
+tags: [R, PostgreSQL, Data Engineering, Data Analysis, Divvy]
 output: 
+  pdf_document: default
   html_document:
     theme:
       bg: "#1b1b1b"
@@ -17,7 +23,6 @@ output:
     toc_float:
       collapsed: true
       smooth_scroll: false
-  pdf_document: default
 ---
 
 <br>
@@ -46,7 +51,6 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 # Show all rows in tibbles/data frames
 options(dplyr.print_min = Inf, dplyr.print_max = Inf)
 
-
 # Set default CRAN mirror (fixes the error)
 options(repos = c(CRAN = "https://cloud.r-project.org"))
 
@@ -67,7 +71,7 @@ for (pkg in required_pkgs) {
 Here, I read my PostgreSQL database credentials from a secure .ini configuration file and establish a connection using the RPostgres driver. I wrap the connection inside a tryCatch() block to handle connection errors gracefully. Once the connection is established, I register it for use by all subsequent SQL chunks.
 ```{r db_connection, warning=FALSE, message=FALSE}
 # Read config
-config <- read.ini("db_config.ini")
+config <- read.ini("resources/db_config.ini")
 db <- config$postgresql
 
 # Safe database connection
@@ -170,7 +174,8 @@ We’ll build a normalized core:
  - dim_member_type, dim_bike_type: small lookup tables.
  - fact_trips: the single deduplicated table referencing dimensions.
  
-#### Dimension tables
+### Dimension tables
+
 **Station dimension**
 I create a dimension table called `dim_station` to store information about each bike station. This includes station ID, name, and coordinates (latitude and longitude). It provides a reference point for mapping and spatial analysis.
 ```{sql dim_station}
@@ -306,7 +311,7 @@ FROM generate_series('2024-01-01'::date, '2024-12-31'::date, '1 day') AS s(d)
 ON CONFLICT (date_id) DO NOTHING;
 ```
  
-#### Fact table
+### Fact table
 In this SQL chunk, I define the central fact table — `fact_trips`. It contains every individual trip record with foreign keys linking to the relevant dimensions (`bike_type_id`, `member_type_id`, and `station_id`). This is the heart of the star schema that enables efficient analytics and aggregations.
 ```{sql fact_trips}
 CREATE TABLE IF NOT EXISTS divvy.fact_trips (
@@ -331,7 +336,7 @@ CREATE TABLE IF NOT EXISTS divvy.fact_trips (
 );
 ```
 
-#### Helper mappings
+### Helper mappings
 Temporary mapping tables for bike table upserts.
 ```{sql tmp_bike_map}
 CREATE TEMP TABLE tmp_bike_map AS
@@ -343,7 +348,7 @@ CREATE TEMP TABLE tmp_member_map AS
 SELECT member_casual, member_type_id FROM divvy.dim_member_type;
 ```
 
-#### Upsert into fact table
+### Upsert into fact table
 This is where I load all twelve months of trip data from the staging tables into the main fact_trips table. During insertion, I join with the dimension tables to replace text values (like rideable_type and member_casual) with their corresponding foreign key IDs. This ensures data consistency and enforces referential integrity.
 ```{sql upsert_fact_trips}
 INSERT INTO divvy.fact_trips
@@ -543,16 +548,16 @@ $$;
 <br>
 
 ## Exploratory Data Analysis (SQL)
-### Segment share
-Segment share over time (daily)
+### Segment share over time (daily)
+In this step, I query the vw_daily_counts view to examine how ride activity varies daily between casual and member users. This view aggregates trips by date and user segment, giving me both total ride counts and average ride durations per day. By ordering the results chronologically, I can visually inspect fluctuations in ridership — for example, whether weekends see more casual riders or weekdays are dominated by members. This daily segmentation helps me understand recurring behavioral patterns and demand cycles that could inform scheduling and promotional campaigns.
 ```{sql daily_counts}
 SELECT * 
 FROM divvy.vw_daily_counts 
 ORDER BY started_date, member_casual;
 ```
 
-### Weekly trend
-Weekly trend by segment
+### Weekly trend by segment
+Here, I summarize ride activity on a weekly basis using the vw_weekly_counts view. Grouping trips by ISO week and user category allows me to smooth out short-term fluctuations and highlight broader temporal trends. I use this analysis to detect seasonality — for instance, identifying whether ridership builds up during warmer months or dips in winter. Comparing weekly totals between casual and member users reveals how engagement evolves through the year and whether certain segments are more resilient to weather or seasonal effects.
 ```{sql weekly_counts}
 SELECT * 
 FROM divvy.vw_weekly_counts 
@@ -560,6 +565,7 @@ ORDER BY year, week, member_casual;
 ```
 
 ### Duration distribution
+In this query, I use the width_bucket() function to bin ride durations (ride_length_min) into 10-minute intervals, focusing on trips lasting up to three hours. Grouping by duration bins helps me understand how long typical rides last and where outliers occur. Most rides fall into the first few bins, confirming that the majority of users take short, point-to-point trips. However, the right-tail of the distribution highlights longer recreational or tourist rides. This duration profile is vital for understanding demand characteristics, pricing optimization, and potential operational adjustments such as battery swap cycles for electric bikes.
 ```{sql duration_distribution}
 SELECT
   width_bucket(ride_length_min, 0, 120, 12) AS bin, -- 10 min bins up to 120
@@ -570,13 +576,14 @@ GROUP BY bin
 ORDER BY bin;
 ```
 
-### Top 10 start/end stations
-This query identifies the top start stations by total rides, ranking them in descending order. I join fact_trips with dim_station to retrieve human-readable names and then group by start_station_name. By analyzing the top stations for casual and member users separately, I can identify geographic hotspots — members may cluster around transit hubs or offices, while casuals may favor tourist or recreational areas. This insight supports both operational logistics (bike placement) and marketing segmentation.
+### Top start stations
+This query ranks the most popular starting stations across the entire network. I use the vw_top_start_stations view, which aggregates ride counts by station ID and name, and then limit the results to the top ten. These high-volume stations reveal geographic hotspots — locations that serve as key entry points into the Divvy system. In practice, member riders tend to start near residential or transit zones, while casual riders cluster around landmarks and tourist destinations. Understanding this split supports station rebalancing and targeted marketing strategies.
 ```{sql top_start_stations}
 SELECT * FROM divvy.vw_top_start_stations LIMIT 10;
 ```
 
-Similar to the previous chunk, this query ranks the top end stations by trip count. Analyzing both start and end station patterns helps reveal common travel flows — whether users tend to return bikes at the same stations or follow distinct routes. Comparing casual and member drop-off behavior highlights differences in trip intent: members may end rides near workplaces or transit, while casuals might finish near parks or attractions. This spatial perspective is crucial for demand forecasting and route planning.
+### Top end stations
+Similar to the previous analysis, this query identifies the stations where most rides conclude. By grouping and ranking end-station counts, I can detect where trips commonly terminate. Comparing start and end patterns helps me uncover directional flow — for example, if certain routes act as commuter corridors. The prevalence of end stations near transit hubs or parks may indicate where demand peaks at specific times of day. These findings assist in aligning operational resources, such as maintenance and bike redistribution, with user drop-off behavior.
 ```{sql top_end_stations}
 SELECT
   end_station_id, end_station_name, COUNT(*) AS rides
@@ -587,7 +594,7 @@ LIMIT 10;
 ```
 
 ### Top routes
-In this SQL chunk, I identify the most common start–end station combinations, or “routes,” based on the number of rides taken along each. I join the tables vw_route_counts and vw_trips_enriched using station IDs and group by start station, end station, and user type (member_casual). Then I order the results by descending ride counts and limit to the top 10.
+In this step, I investigate the most frequent station-to-station combinations, or “routes.” By grouping rides by both origin and destination along with user type, I can see which corridors dominate overall ridership. Member users often exhibit repeated, short-distance commuting routes, while casual users favor scenic loops or one-way recreational rides. Analyzing these top routes not only identifies core commuter pathways but also helps visualize network connectivity and informs potential station expansions or capacity adjustments.
 ```{sql top_routes}
 SELECT
   start_station_name, end_station_name, member_casual,
@@ -599,6 +606,7 @@ LIMIT 10;
 ```
 
 ### Peak by hour and weekday
+This query explores temporal ride patterns by extracting both the hour of day and day of week from each trip’s start time. Grouping by these dimensions reveals when demand is highest throughout the week. Predictably, member users often contribute to morning and evening peaks during weekdays — consistent with commuting behavior — whereas casual riders are more active on weekends and afternoons. These hourly and weekday insights are fundamental for understanding demand rhythms, scheduling maintenance windows, and supporting time-based forecasting models.
 ```{sql peak_by_hour_dow}
 SELECT
   EXTRACT(DOW FROM started_at) AS dow,
@@ -613,8 +621,9 @@ ORDER BY 1,2;
 
 ## Exploratory Data Analysis (R)
 ### Daily rides by segment
+In this visualization, I connect directly to the vw_daily_counts view to retrieve daily ride totals for each user segment. I plot the results using ggplot2, with dates on the x-axis and ride counts on the y-axis, distinguishing casual and member users by color.
+This chart helps me visually track day-to-day fluctuations and seasonal patterns throughout 2024. I can immediately see how member rides dominate weekday traffic, while casual rides surge during weekends and warmer months. The clear seasonality and recurring peaks make this a foundational view for understanding overall usage trends.
 ```{r eda_daily_rides}
-# 8.1 Daily rides by segment
 daily <- dbGetQuery(con, "SELECT started_date, member_casual, rides
                           FROM divvy.vw_daily_counts")
 ggplot(daily, aes(as.Date(started_date), rides, color = member_casual)) +
@@ -623,9 +632,10 @@ ggplot(daily, aes(as.Date(started_date), rides, color = member_casual)) +
        x = "Date", y = "Rides", color = "User Type")
 ```
 
-### Weekly trend
+### Weekly trend by segment
+Here, I aggregate the data further by ISO week to reduce day-level noise and emphasize broader temporal trends. By plotting weekly ride counts for both user types, I can observe how participation evolves through the year — particularly the sustained growth from spring into summer and gradual tapering toward winter.
+This visualization gives me a macro-level perspective on seasonal dynamics, helping to identify long-term shifts in engagement. Weekly granularity also makes it easier to compare segment growth rates and identify anomalies like weather disruptions or special events affecting ridership.
 ```{r eda_weekly_trend}
-# 8.2 Weekly trend
 weekly <- dbGetQuery(con, "SELECT year, week, member_casual, rides
                            FROM divvy.vw_weekly_counts")
 weekly$date <- ISOweek2date(paste0(weekly$year, "-W", sprintf("%02d", weekly$week), "-1"))
@@ -636,8 +646,9 @@ ggplot(weekly, aes(date, rides, color = member_casual)) +
 ```
 
 ### Duration distribution
+In this step, I visualize the distribution of ride durations using a histogram of ride_length_min from vw_trips_enriched. I limit the data to rides lasting three hours or less to focus on typical behavior and exclude outliers.
+The resulting histogram confirms a strong right-skewed pattern, where most rides last under 30 minutes. Members tend to complete shorter, utilitarian rides, while casual riders contribute more to the long-duration tail. This insight reinforces operational expectations — quick turnover of bikes among members versus leisurely, exploratory rides by casual users.
 ```{r eda_duration_distribution}
-# 8.3 Duration distribution
 dur <- dbGetQuery(con, "
   SELECT ride_length_min
   FROM divvy.vw_trips_enriched
@@ -650,8 +661,10 @@ ggplot(dur, aes(ride_length_min)) +
 ```
 
 ### Top stations
+This visualization showcases the top ten starting stations by ride volume. After pulling data from vw_top_start_stations, I use a horizontal bar chart to display the stations in descending order of rides.
+The clear dominance of locations such as Streeter Dr & Grand Ave and DuSable Lake Shore Dr & Monroe St highlights the popularity of tourist-heavy and waterfront areas. In contrast, stations near transit and commercial zones attract more member activity.
+This view is particularly helpful for station-level demand planning, rebalancing strategies, and targeted marketing efforts around the most active hubs.
 ```{r eda_top_stations}
-# 8.4 Top stations
 topstarts <- dbGetQuery(con, "
                         SELECT * 
                         FROM divvy.vw_top_start_stations 
@@ -664,6 +677,8 @@ ggplot(topstarts, aes(reorder(start_station_name, rides), rides)) +
 ```
 
 ### Top routes by segment
+In this section, I join vw_route_counts with vw_trips_enriched to capture the most common station-to-station routes. Grouping by both stations and user type allows me to see how trip flows differ between members and casual riders.
+Visualizing the top 30 routes reveals distinct behavioral patterns: members frequently travel between work and home hubs (e.g., State St to Calumet Ave), while casual riders often follow scenic or circular routes along the lakefront. These findings provide insight into how Divvy bikes are used functionally versus recreationally, helping to guide infrastructure and expansion planning.
 ```{r eda5_top_routes}
 routes <- dbGetQuery(con, "
   SELECT 
@@ -684,8 +699,10 @@ routes <- dbGetQuery(con, "
 <br>
 
 ## Data Quality & Maintenance
-### Quick checks
-I check for missing data in key columns such as start and end stations or bike type. This helps me identify potential data quality issues or incomplete records that may need cleaning before analysis.
+While not strictly part of EDA, I also include a few diagnostic queries to ensure my analytical base is reliable. I check for missing values in timestamps and ride IDs to confirm data completeness, verify there are no duplicate ride identifiers to prevent double-counting, and validate that ride durations are positive due to built-in CHECK constraints. These quality controls provide confidence that my subsequent analyses and visualizations are grounded in clean, consistent data.
+
+### Missing value
+I run a quick aggregation query to count any missing values in critical columns like started_at, ended_at, and ride_id. Confirming zero missing entries assures me that no rides were lost during data import and that all time-based analyses will operate on complete records.
 ```{sql check_missing_criticals}
 SELECT
   SUM((started_at IS NULL)::int) AS missing_started,
@@ -694,19 +711,22 @@ SELECT
 FROM divvy.fact_trips;
 ```
 
-I look for duplicate ride_id entries in the fact table. Since ride_id should be unique for each trip, this step ensures the integrity of the dataset and prevents double-counting in later analysis.
+### Duplicate ride_id
+I check for duplicate ride_id values in the fact_trips table to ensure primary key integrity. Since every ride should have a unique identifier, the absence of duplicates validates that the ETL pipeline correctly deduplicated records from all twelve monthly tables.
 ```{sql check_duplicates}
 SELECT ride_id, COUNT(*) FROM divvy.fact_trips
 GROUP BY ride_id HAVING COUNT(*) > 1;
 ```
 
-Check for negative or zero durations (should be 0 due to CHECK constraint)
+### Negative or invalid duration
+Finally, I verify that no rides have negative or zero durations — a sanity check supported by the table’s CHECK constraint. This confirms logical consistency across all trip records and ensures no erroneous timestamps remain in the dataset.
 ```{sql check_negative_durations}
 SELECT COUNT(*) FROM divvy.fact_trips
 WHERE ended_at < started_at OR ride_length_min < 0;
 ```
 
 ### Refresh cadence
+To maintain data accuracy, I document the steps for updating the system whenever new data arrives. This involves loading the new month’s file into staging tables, merging it into the dimensions and fact_trips table using upserts, and refreshing all materialized views. This refresh cycle guarantees that my aggregated dashboards and time-series analyses always reflect the latest available data.
 ```{sql refresh2_mv_monthly_summary}
 -- When new months arrive, re-run:
 -- 1) load into staging,
@@ -715,7 +735,11 @@ WHERE ended_at < started_at OR ride_length_min < 0;
 REFRESH MATERIALIZED VIEW divvy.mv_monthly_summary;
 ```
 
------------------------------------------------------------------------ The END -----------------------------------------------------------------------
+<br>
+
+## Conclusion
+
+----------------------------------------------------------------- The END ----------------------------------------------------------------- 
 
 ```{r include=FALSE}
 dbDisconnect(con)
